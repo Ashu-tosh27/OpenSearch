@@ -32,6 +32,8 @@ import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexOutput;
 import org.apache.lucene.store.Lock;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.index.codec.composite.LuceneDocValuesConsumerFactory;
@@ -417,93 +419,558 @@ public class StarTreeUpgradeService {
         Lock writeLock = directory.obtainLock(IndexWriter.WRITE_LOCK_NAME);
         try {
             SegmentInfos originalInfos = SegmentInfos.readLatestCommit(directory);
-        SegmentInfos newSegmentInfos = originalInfos.clone();
-        newSegmentInfos.clear();
+            SegmentInfos newSegmentInfos = originalInfos.clone();
+            newSegmentInfos.clear();
 
-        for (SegmentCommitInfo commitInfo : originalInfos) {
-            if (upgradedSegmentNames.contains(commitInfo.info.name)) {
-                SegmentInfo oldInfo = commitInfo.info;
+            for (SegmentCommitInfo commitInfo : originalInfos) {
+                if (upgradedSegmentNames.contains(commitInfo.info.name)) {
+                    SegmentInfo oldInfo = commitInfo.info;
 
-                // Create new SegmentInfo with Composite912Codec, copying all other fields.
-                // Keep useCompoundFile as-is — the original segment data stays in .cfs.
-                // Star tree files (.cid, .cim, .cidvd, .cidvm) are outside .cfs, and
-                // Composite912DocValuesReader falls back to segmentInfo.dir when it can't
-                // find them in the CompoundDirectory.
-                SegmentInfo newInfo = new SegmentInfo(
-                    oldInfo.dir,
-                    oldInfo.getVersion(),
-                    oldInfo.getMinVersion(),
-                    oldInfo.name,
-                    oldInfo.maxDoc(),
-                    oldInfo.getUseCompoundFile(),
-                    oldInfo.getHasBlocks(),
-                    new Composite912Codec(),
-                    oldInfo.getDiagnostics(),
-                    oldInfo.getId(),
-                    oldInfo.getAttributes(),
-                    oldInfo.getIndexSort()
-                );
+                    // Create new SegmentInfo with Composite912Codec, copying all other fields.
+                    // Keep useCompoundFile as-is — the original segment data stays in .cfs.
+                    // Star tree files (.cid, .cim, .cidvd, .cidvm) are outside .cfs, and
+                    // Composite912DocValuesReader falls back to segmentInfo.dir when it can't
+                    // find them in the CompoundDirectory.
+                    SegmentInfo newInfo = new SegmentInfo(
+                        oldInfo.dir,
+                        oldInfo.getVersion(),
+                        oldInfo.getMinVersion(),
+                        oldInfo.name,
+                        oldInfo.maxDoc(),
+                        oldInfo.getUseCompoundFile(),
+                        oldInfo.getHasBlocks(),
+                        new Composite912Codec(),
+                        oldInfo.getDiagnostics(),
+                        oldInfo.getId(),
+                        oldInfo.getAttributes(),
+                        oldInfo.getIndexSort()
+                    );
 
-                // Add star tree files to the file set (original files + star tree files)
-                Set<String> files = new HashSet<>(oldInfo.files());
-                String segName = oldInfo.name;
-                files.add(IndexFileNames.segmentFileName(segName, "", Composite912DocValuesFormat.DATA_EXTENSION));
-                files.add(IndexFileNames.segmentFileName(segName, "", Composite912DocValuesFormat.META_EXTENSION));
-                files.add(IndexFileNames.segmentFileName(segName, "", Composite912DocValuesFormat.DATA_DOC_VALUES_EXTENSION));
-                files.add(IndexFileNames.segmentFileName(segName, "", Composite912DocValuesFormat.META_DOC_VALUES_EXTENSION));
-                newInfo.setFiles(files);
+                    // Add star tree files to the file set (original files + star tree files)
+                    Set<String> files = new HashSet<>(oldInfo.files());
+                    String segName = oldInfo.name;
+                    files.add(IndexFileNames.segmentFileName(segName, "", Composite912DocValuesFormat.DATA_EXTENSION));
+                    files.add(IndexFileNames.segmentFileName(segName, "", Composite912DocValuesFormat.META_EXTENSION));
+                    files.add(IndexFileNames.segmentFileName(segName, "", Composite912DocValuesFormat.DATA_DOC_VALUES_EXTENSION));
+                    files.add(IndexFileNames.segmentFileName(segName, "", Composite912DocValuesFormat.META_DOC_VALUES_EXTENSION));
+                    newInfo.setFiles(files);
 
-                // Assertions to verify no state is lost
-                assert newInfo.maxDoc() == oldInfo.maxDoc();
-                assert newInfo.getVersion().equals(oldInfo.getVersion());
-                assert Arrays.equals(newInfo.getId(), oldInfo.getId());
-                assert Objects.equals(newInfo.getIndexSort(), oldInfo.getIndexSort());
-                assert newInfo.getAttributes().equals(oldInfo.getAttributes());
+                    // Assertions to verify no state is lost
+                    assert newInfo.maxDoc() == oldInfo.maxDoc();
+                    assert newInfo.getVersion().equals(oldInfo.getVersion());
+                    assert Arrays.equals(newInfo.getId(), oldInfo.getId());
+                    assert Objects.equals(newInfo.getIndexSort(), oldInfo.getIndexSort());
+                    assert newInfo.getAttributes().equals(oldInfo.getAttributes());
 
-                // Create new SegmentCommitInfo preserving all commit metadata
-                SegmentCommitInfo newCommitInfo = new SegmentCommitInfo(
-                    newInfo,
-                    commitInfo.getDelCount(),
-                    commitInfo.getSoftDelCount(),
-                    commitInfo.getDelGen(),
-                    commitInfo.getFieldInfosGen(),
-                    commitInfo.getDocValuesGen(),
-                    commitInfo.getId()
-                );
+                    // Create new SegmentCommitInfo preserving all commit metadata
+                    SegmentCommitInfo newCommitInfo = new SegmentCommitInfo(
+                        newInfo,
+                        commitInfo.getDelCount(),
+                        commitInfo.getSoftDelCount(),
+                        commitInfo.getDelGen(),
+                        commitInfo.getFieldInfosGen(),
+                        commitInfo.getDocValuesGen(),
+                        commitInfo.getId()
+                    );
 
-                newSegmentInfos.add(newCommitInfo);
+                    newSegmentInfos.add(newCommitInfo);
 
-                // Rewrite the .si file so it declares Composite912Codec.
-                // The .si file stores the codec name that Lucene uses when opening the segment.
-                // Without rewriting it, Lucene would use the original codec to read the segment
-                // and would not invoke Composite912DocValuesReader for star tree data.
-                String siFileName = IndexFileNames.segmentFileName(segName, "", "si");
-                directory.deleteFile(siFileName);
-                new Composite912Codec().segmentInfoFormat().write(directory, newInfo, IOContext.DEFAULT);
-            } else {
-                // Keep original SegmentCommitInfo unchanged
-                newSegmentInfos.add(commitInfo);
+                    // Rewrite the .si file so it declares Composite912Codec.
+                    // The .si file stores the codec name that Lucene uses when opening the segment.
+                    // Without rewriting it, Lucene would use the original codec to read the segment
+                    // and would not invoke Composite912DocValuesReader for star tree data.
+                    String siFileName = IndexFileNames.segmentFileName(segName, "", "si");
+                    directory.deleteFile(siFileName);
+                    new Composite912Codec().segmentInfoFormat().write(directory, newInfo, IOContext.DEFAULT);
+                } else {
+                    // Keep original SegmentCommitInfo unchanged
+                    newSegmentInfos.add(commitInfo);
+                }
             }
-        }
 
-        // Copy user data from original SegmentInfos
-        newSegmentInfos.setUserData(originalInfos.getUserData(), false);
+            // Copy user data from original SegmentInfos
+            newSegmentInfos.setUserData(originalInfos.getUserData(), false);
 
-        // Commit segments_N+1 atomically (generation auto-incremented by commit())
-        newSegmentInfos.commit(directory);
-        directory.sync(newSegmentInfos.files(true));
-        directory.syncMetaData();
+            // Commit segments_N+1 atomically (generation auto-incremented by commit())
+            newSegmentInfos.commit(directory);
+            directory.sync(newSegmentInfos.files(true));
+            directory.syncMetaData();
 
-        logger.info(
-            "SegmentInfos rewrite complete — committed new segment infos for {} upgraded segments. "
-                + "Generation: {}, files: {}, directory listing: {}",
-            upgradedSegmentNames.size(),
-            newSegmentInfos.getGeneration(),
-            newSegmentInfos.files(true),
-            java.util.Arrays.toString(directory.listAll())
-        );
+            logger.info(
+                "SegmentInfos rewrite complete — committed new segment infos for {} upgraded segments. "
+                    + "Generation: {}, files: {}, directory listing: {}",
+                upgradedSegmentNames.size(),
+                newSegmentInfos.getGeneration(),
+                newSegmentInfos.files(true),
+                java.util.Arrays.toString(directory.listAll())
+            );
         } finally {
             writeLock.close();
+        }
+    }
+
+    /**
+     * Builds sidecar star tree data for all eligible segments in the given directory.
+     * <p>
+     * Opens a {@link DirectoryReader} snapshot on the live directory to pin segment file handles.
+     * Iterates each segment: skips native composite segments and segments that already have sidecar
+     * data (idempotent). For each eligible segment, builds star tree sidecar files using
+     * {@link #buildSidecarStarTreeDataForSegment}. Tracks all files written in a per-run set.
+     * <p>
+     * After building, reads the current {@link SegmentInfos} to detect segments merged away during
+     * the build. Discards sidecar files for merged-away segments. Registers surviving segments in
+     * metadata and commits. In the finally block, deletes any file in the per-run set that is NOT
+     * in committed metadata (cleanup of partial/orphaned files).
+     *
+     * @param directory      the index directory containing the segments
+     * @param starTreeField  the star tree configuration
+     * @param mapperService  needed by BaseStarTreeBuilder.generateMetricAggregatorInfos()
+     * @param metadata       the sidecar metadata instance for tracking segment entries
+     * @return               the number of segments that were upgraded with sidecar star tree data
+     * @throws IOException   if an I/O error occurs during the build process
+     */
+    public static int buildSidecarStarTreeData(
+        Directory directory,
+        StarTreeField starTreeField,
+        MapperService mapperService,
+        StarTreeSidecarMetadata metadata
+    ) throws IOException {
+        logger.info("Starting sidecar star tree build");
+
+        Set<String> filesWrittenThisRun = new HashSet<>();
+        Set<String> successfulSegments = new HashSet<>();
+        DirectoryReader directoryReader = null;
+
+        try {
+            // Step 1: Open a DirectoryReader snapshot to pin segment file handles
+            directoryReader = DirectoryReader.open(directory);
+            long pinnedGeneration = directoryReader.getIndexCommit().getGeneration();
+            logger.info(
+                "Pinned DirectoryReader at generation [{}] with [{}] leaves, directory class=[{}], files=[{}]",
+                pinnedGeneration,
+                directoryReader.leaves().size(),
+                directory.getClass().getSimpleName(),
+                java.util.Arrays.toString(directory.listAll())
+            );
+
+            // Step 2: Iterate each segment
+            int skippedCount = 0;
+            int failedCount = 0;
+            int nativeCount = 0;
+
+            for (LeafReaderContext leafContext : directoryReader.leaves()) {
+                SegmentReader segmentReader = Lucene.segmentReader(leafContext.reader());
+                String segmentName = segmentReader.getSegmentName();
+                SegmentCommitInfo commitInfo = segmentReader.getSegmentInfo();
+
+                // Skip if segment already uses Composite912Codec (native composite segment)
+                if (Composite912Codec.COMPOSITE_INDEX_CODEC_NAME.equals(commitInfo.info.getCodec().getName())) {
+                    logger.debug("Segment [{}] already uses Composite912Codec (native star tree)", segmentName);
+                    nativeCount++;
+                    continue;
+                }
+
+                // Skip if sidecar already exists (idempotent)
+                if (metadata.hasStarTreeData(segmentName)) {
+                    logger.debug("Skipping segment [{}] — sidecar already exists", segmentName);
+                    skippedCount++;
+                    continue;
+                }
+
+                try {
+                    // Compute actual live doc count accounting for BOTH hard and soft deletes.
+                    int maxDoc = commitInfo.info.maxDoc();
+                    int delCount = commitInfo.getDelCount();
+                    int softDelCount = commitInfo.getSoftDelCount();
+                    int actualLiveDocs = maxDoc - delCount - softDelCount;
+
+                    // Skip segments with 0 live docs (all docs deleted via hard or soft deletes)
+                    if (actualLiveDocs <= 0) {
+                        logger.info(
+                            "Skipping segment [{}] — all docs deleted (maxDoc={}, hardDel={}, softDel={}, live={})",
+                            segmentName,
+                            maxDoc,
+                            delCount,
+                            softDelCount,
+                            actualLiveDocs
+                        );
+                        skippedCount++;
+                        continue;
+                    }
+
+                    // Build a combined liveDocs bitset that accounts for BOTH hard and soft deletes.
+                    // segmentReader.getLiveDocs() only reflects hard deletes. OpenSearch uses soft
+                    // deletes (via __soft_deletes NumericDocValues field) which are applied by
+                    // SoftDeletesDirectoryReaderWrapper at query time. Since we open a raw
+                    // DirectoryReader without that wrapper, we must manually combine both.
+                    Bits hardDeleteLiveDocs = segmentReader.getLiveDocs();
+                    Bits liveDocs = null;
+                    int numLiveDocs = actualLiveDocs;
+
+                    if (softDelCount > 0 || hardDeleteLiveDocs != null) {
+                        // Build combined bitset: a doc is live only if NOT hard-deleted AND NOT soft-deleted
+                        FixedBitSet combinedLiveDocs = new FixedBitSet(maxDoc);
+
+                        // Start with all docs live, then exclude hard deletes
+                        if (hardDeleteLiveDocs != null) {
+                            for (int i = 0; i < maxDoc; i++) {
+                                if (hardDeleteLiveDocs.get(i)) {
+                                    combinedLiveDocs.set(i);
+                                }
+                            }
+                        } else {
+                            // No hard deletes — all docs start as live
+                            combinedLiveDocs.set(0, maxDoc);
+                        }
+
+                        // Now exclude soft deletes
+                        if (softDelCount > 0) {
+                            NumericDocValues softDeleteDV = segmentReader.getNumericDocValues(Lucene.SOFT_DELETES_FIELD);
+                            if (softDeleteDV != null) {
+                                for (int doc = softDeleteDV.nextDoc(); doc != DocIdSetIterator.NO_MORE_DOCS; doc = softDeleteDV.nextDoc()) {
+                                    if (softDeleteDV.longValue() == 1) {
+                                        combinedLiveDocs.clear(doc);
+                                    }
+                                }
+                            }
+                        }
+
+                        liveDocs = combinedLiveDocs;
+                        numLiveDocs = combinedLiveDocs.cardinality();
+                    }
+
+                    logger.debug(
+                        "Building sidecar star tree data for segment [{}], liveDocs={}, numLiveDocs={}",
+                        segmentName,
+                        liveDocs != null ? "present" : "null",
+                        numLiveDocs
+                    );
+
+                    // Build sidecar files for this segment
+                    Set<String> segmentFiles = buildSidecarStarTreeDataForSegment(
+                        directory,
+                        commitInfo,
+                        starTreeField,
+                        mapperService,
+                        liveDocs,
+                        numLiveDocs
+                    );
+
+                    // Track files written
+                    filesWrittenThisRun.addAll(segmentFiles);
+                    successfulSegments.add(segmentName);
+
+                    logger.debug("Sidecar star tree files written for segment [{}]: {}", segmentName, segmentFiles);
+                } catch (Exception e) {
+                    failedCount++;
+                    logger.error("Failed to build sidecar star tree data for segment [{}]: {}", segmentName, e.getMessage(), e);
+
+                    // Clean up partial files for this segment
+                    for (String ext : STAR_TREE_FILE_EXTENSIONS) {
+                        String fileName = IndexFileNames.segmentFileName(segmentName, "", ext);
+                        try {
+                            directory.deleteFile(fileName);
+                            filesWrittenThisRun.remove(fileName);
+                        } catch (IOException deleteEx) {
+                            logger.warn("Failed to clean up partial sidecar file [{}]: {}", fileName, deleteEx.getMessage());
+                        }
+                    }
+                }
+
+                // Yield between segments
+                Thread.yield();
+            }
+
+            // Step 3: Close the DirectoryReader snapshot
+            directoryReader.close();
+            directoryReader = null;
+
+            // Step 4: Read current SegmentInfos to detect merged-away segments
+            SegmentInfos currentInfos = SegmentInfos.readLatestCommit(directory);
+            Set<String> currentSegmentNames = new HashSet<>();
+            for (SegmentCommitInfo ci : currentInfos) {
+                currentSegmentNames.add(ci.info.name);
+            }
+
+            // Step 5: For each successfully built segment, check if it still exists
+            Set<String> survivingSegments = new HashSet<>();
+            for (String segName : successfulSegments) {
+                if (currentSegmentNames.contains(segName)) {
+                    survivingSegments.add(segName);
+                } else {
+                    // Segment was merged away — discard its sidecar files
+                    logger.info("Segment [{}] was merged away during build, discarding sidecar files", segName);
+                    for (String ext : STAR_TREE_FILE_EXTENSIONS) {
+                        String fileName = IndexFileNames.segmentFileName(segName, "", ext);
+                        try {
+                            directory.deleteFile(fileName);
+                        } catch (IOException e) {
+                            logger.warn("Failed to delete sidecar file for merged-away segment [{}]: {}", fileName, e.getMessage());
+                        }
+                        filesWrittenThisRun.remove(fileName);
+                    }
+                }
+            }
+
+            // Step 6: Register surviving segments in metadata
+            for (String segName : survivingSegments) {
+                Set<String> segFiles = new HashSet<>();
+                for (String ext : STAR_TREE_FILE_EXTENSIONS) {
+                    segFiles.add(IndexFileNames.segmentFileName(segName, "", ext));
+                }
+                metadata.register(segName, segFiles);
+            }
+
+            // Step 7: Commit metadata
+            if (survivingSegments.isEmpty() == false) {
+                metadata.commit(directory);
+            }
+
+            logger.info(
+                "Sidecar star tree build complete — total segments: {}, sidecar built: {}, already native: {}, "
+                    + "skipped (sidecar existed or empty): {}, failed: {}, merged-away: {}",
+                survivingSegments.size() + nativeCount + skippedCount + failedCount,
+                survivingSegments.size(),
+                nativeCount,
+                skippedCount,
+                failedCount,
+                successfulSegments.size() - survivingSegments.size()
+            );
+
+            return survivingSegments.size() + nativeCount;
+
+        } finally {
+            // Close DirectoryReader if still open
+            if (directoryReader != null) {
+                try {
+                    directoryReader.close();
+                } catch (Exception e) {
+                    logger.warn("Failed to close DirectoryReader during sidecar build cleanup", e);
+                }
+            }
+
+            // Delete any file in filesWrittenThisRun that is NOT in committed metadata
+            for (String fileName : filesWrittenThisRun) {
+                if (metadata.containsFile(fileName) == false) {
+                    try {
+                        directory.deleteFile(fileName);
+                        logger.debug("Cleaned up uncommitted sidecar file [{}]", fileName);
+                    } catch (IOException e) {
+                        logger.warn("Failed to clean up uncommitted sidecar file [{}]: {}", fileName, e.getMessage());
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Builds sidecar star tree files for a single segment.
+     * <p>
+     * Similar to {@link #buildStarTreeData} but uses {@link LiveDocsFilteredDocValuesProducer}
+     * when {@code liveDocs != null} to skip deleted documents, and uses {@code numLiveDocs}
+     * (not maxDoc) for the {@link SegmentWriteState}. Returns the set of sidecar file names written.
+     *
+     * @param directory      the index directory
+     * @param commitInfo     the segment commit info for the segment to process
+     * @param starTreeField  the star tree configuration
+     * @param mapperService  needed by BaseStarTreeBuilder.generateMetricAggregatorInfos()
+     * @param liveDocs       the live docs bitset (null if no deletes)
+     * @param numLiveDocs    the number of live (non-deleted) documents
+     * @return               the set of sidecar file names written (e.g., {"_0.cid", "_0.cim", "_0.cidvd", "_0.cidvm"})
+     * @throws IOException   if an I/O error occurs during star tree data generation
+     */
+    static Set<String> buildSidecarStarTreeDataForSegment(
+        Directory directory,
+        SegmentCommitInfo commitInfo,
+        StarTreeField starTreeField,
+        MapperService mapperService,
+        Bits liveDocs,
+        int numLiveDocs
+    ) throws IOException {
+        String segmentName = commitInfo.info.name;
+        DirectoryReader directoryReader = null;
+        IndexOutput dataOut = null;
+        IndexOutput metaOut = null;
+        DocValuesConsumer compositeDocValuesConsumer = null;
+        Set<String> filesWritten = new HashSet<>();
+
+        try {
+            // Open a DirectoryReader and find the matching SegmentReader by segment name
+            directoryReader = DirectoryReader.open(directory);
+            SegmentReader segmentReader = null;
+            for (LeafReaderContext leafContext : directoryReader.leaves()) {
+                SegmentReader candidate = Lucene.segmentReader(leafContext.reader());
+                if (candidate.getSegmentName().equals(segmentName)) {
+                    segmentReader = candidate;
+                    break;
+                }
+            }
+            if (segmentReader == null) {
+                throw new IOException("Could not find SegmentReader for segment [" + segmentName + "]");
+            }
+
+            // Get DocValuesProducer from the reader
+            DocValuesProducer docValuesProducer = segmentReader.getDocValuesReader();
+            if (docValuesProducer == null) {
+                throw new IOException("No DocValuesProducer available for segment [" + segmentName + "]");
+            }
+
+            // If liveDocs != null, wrap in LiveDocsFilteredDocValuesProducer
+            DocValuesProducer effectiveProducer = docValuesProducer;
+            if (liveDocs != null) {
+                effectiveProducer = new LiveDocsFilteredDocValuesProducer(docValuesProducer, liveDocs, commitInfo.info.maxDoc());
+            }
+
+            // Build fieldProducerMap for all dimensions and metrics
+            Map<String, DocValuesProducer> fieldProducerMap = new HashMap<>();
+            for (Dimension dimension : starTreeField.getDimensionsOrder()) {
+                fieldProducerMap.put(dimension.getField(), effectiveProducer);
+            }
+            for (Metric metric : starTreeField.getMetrics()) {
+                fieldProducerMap.put(metric.getField(), effectiveProducer);
+            }
+            // Add _doc_count with empty NumericDocValues producer
+            fieldProducerMap.put(DocCountFieldMapper.NAME, new EmptyDocValuesProducer() {
+                @Override
+                public NumericDocValues getNumeric(FieldInfo field) {
+                    return DocValues.emptyNumeric();
+                }
+            });
+
+            // Create SegmentWriteState with numLiveDocs (not maxDoc) for contiguous doc ID space
+            FieldInfos fieldInfos = segmentReader.getFieldInfos();
+            SegmentInfo segInfo = commitInfo.info;
+            SegmentInfo writeSegInfo = new SegmentInfo(
+                directory,
+                segInfo.getVersion(),
+                segInfo.getMinVersion(),
+                segInfo.name,
+                numLiveDocs, // use numLiveDocs instead of maxDoc
+                false,
+                segInfo.getHasBlocks(),
+                segInfo.getCodec(),
+                segInfo.getDiagnostics(),
+                segInfo.getId(),
+                segInfo.getAttributes(),
+                segInfo.getIndexSort()
+            );
+            SegmentWriteState state = new SegmentWriteState(null, directory, writeSegInfo, fieldInfos, null, IOContext.DEFAULT, "");
+
+            // Open IndexOutput for .cid and .cim files with proper CodecUtil headers
+            String dataFileName = IndexFileNames.segmentFileName(segmentName, "", Composite912DocValuesFormat.DATA_EXTENSION);
+            dataOut = directory.createOutput(dataFileName, IOContext.DEFAULT);
+            filesWritten.add(dataFileName);
+            CodecUtil.writeIndexHeader(
+                dataOut,
+                Composite912DocValuesFormat.DATA_CODEC_NAME,
+                Composite912DocValuesFormat.VERSION_CURRENT,
+                segInfo.getId(),
+                ""
+            );
+
+            String metaFileName = IndexFileNames.segmentFileName(segmentName, "", Composite912DocValuesFormat.META_EXTENSION);
+            metaOut = directory.createOutput(metaFileName, IOContext.DEFAULT);
+            filesWritten.add(metaFileName);
+            CodecUtil.writeIndexHeader(
+                metaOut,
+                Composite912DocValuesFormat.META_CODEC_NAME,
+                Composite912DocValuesFormat.VERSION_CURRENT,
+                segInfo.getId(),
+                ""
+            );
+
+            // Create a consumer write state with DocIdSetIterator.NO_MORE_DOCS for sparse doc values
+            SegmentInfo consumerSegInfo = new SegmentInfo(
+                directory,
+                segInfo.getVersion(),
+                segInfo.getMinVersion(),
+                segInfo.name,
+                DocIdSetIterator.NO_MORE_DOCS,
+                false,
+                segInfo.getHasBlocks(),
+                segInfo.getCodec(),
+                segInfo.getDiagnostics(),
+                segInfo.getId(),
+                segInfo.getAttributes(),
+                segInfo.getIndexSort()
+            );
+            SegmentWriteState consumerWriteState = new SegmentWriteState(
+                null,
+                directory,
+                consumerSegInfo,
+                fieldInfos,
+                null,
+                IOContext.DEFAULT,
+                ""
+            );
+
+            // Create DocValuesConsumer for .cidvd and .cidvm files
+            compositeDocValuesConsumer = LuceneDocValuesConsumerFactory.getDocValuesConsumerForCompositeCodec(
+                consumerWriteState,
+                4096,
+                Composite912DocValuesFormat.DATA_DOC_VALUES_CODEC,
+                Composite912DocValuesFormat.DATA_DOC_VALUES_EXTENSION,
+                Composite912DocValuesFormat.META_DOC_VALUES_CODEC,
+                Composite912DocValuesFormat.META_DOC_VALUES_EXTENSION
+            );
+
+            // Track the doc values files
+            String dataDocValuesFileName = IndexFileNames.segmentFileName(
+                segmentName,
+                "",
+                Composite912DocValuesFormat.DATA_DOC_VALUES_EXTENSION
+            );
+            String metaDocValuesFileName = IndexFileNames.segmentFileName(
+                segmentName,
+                "",
+                Composite912DocValuesFormat.META_DOC_VALUES_EXTENSION
+            );
+            filesWritten.add(dataDocValuesFileName);
+            filesWritten.add(metaDocValuesFileName);
+
+            // Build star tree data using StarTreesBuilder
+            try (StarTreesBuilder starTreesBuilder = new StarTreesBuilder(state, mapperService, new AtomicInteger())) {
+                starTreesBuilder.build(metaOut, dataOut, fieldProducerMap, compositeDocValuesConsumer);
+            }
+
+            // Write EOF marker and CodecUtil footer
+            metaOut.writeLong(-1);
+            CodecUtil.writeFooter(metaOut);
+            CodecUtil.writeFooter(dataOut);
+
+            logger.info("Sidecar star tree files written for segment [{}]: {}", segmentName, filesWritten);
+
+            return filesWritten;
+
+        } finally {
+            if (compositeDocValuesConsumer != null) {
+                try {
+                    compositeDocValuesConsumer.close();
+                } catch (Exception e) {
+                    logger.warn("Failed to close DocValuesConsumer for segment [{}]", segmentName, e);
+                }
+            }
+            if (metaOut != null) {
+                try {
+                    metaOut.close();
+                } catch (Exception e) {
+                    logger.warn("Failed to close meta IndexOutput for segment [{}]", segmentName, e);
+                }
+            }
+            if (dataOut != null) {
+                try {
+                    dataOut.close();
+                } catch (Exception e) {
+                    logger.warn("Failed to close data IndexOutput for segment [{}]", segmentName, e);
+                }
+            }
+            if (directoryReader != null) {
+                try {
+                    directoryReader.close();
+                } catch (Exception e) {
+                    logger.warn("Failed to close DirectoryReader for segment [{}]", segmentName, e);
+                }
+            }
         }
     }
 }

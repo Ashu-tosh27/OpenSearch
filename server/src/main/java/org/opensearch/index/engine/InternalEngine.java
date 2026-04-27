@@ -199,6 +199,9 @@ public class InternalEngine extends Engine {
 
     private final CompletionStatsCache completionStatsCache;
 
+    /** Callback for sidecar star tree cleanup after merge. Set by IndexShard when sidecar metadata is loaded. */
+    private volatile Runnable sidecarMergeCleanupCallback;
+
     private final AtomicBoolean trackTranslogLocation = new AtomicBoolean(false);
     private final KeyedLock<Long> noOpKeyedLock = new KeyedLock<>();
 
@@ -604,6 +607,17 @@ public class InternalEngine extends Engine {
     @Nullable
     public String getForceMergeUUID() {
         return forceMergeUUID;
+    }
+
+    /**
+     * Sets the callback for sidecar star tree cleanup after merge. Called by IndexShard when sidecar metadata is loaded.
+     * The callback captures the IndexShard reference and calls the cleanup logic which compares metadata against
+     * current SegmentInfos to find orphaned entries.
+     *
+     * @param callback the cleanup runnable to invoke after merges complete
+     */
+    public void setSidecarMergeCleanupCallback(Runnable callback) {
+        this.sidecarMergeCleanupCallback = callback;
     }
 
     /** Returns how many bytes we are currently moving from indexing buffer to segments on disk */
@@ -2045,7 +2059,7 @@ public class InternalEngine extends Engine {
                 .logger(logger)
                 .buildIndexWriterConfig();
 
-            return createWriter(store.directory(), iwc);
+            return createWriter(store.engineDirectory(), iwc);
         } catch (LockObtainFailedException ex) {
             logger.warn("could not lock IndexWriter", ex);
             throw ex;
@@ -2184,6 +2198,23 @@ public class InternalEngine extends Engine {
                 // we should execute a flush on the next operation if that's a flush after inactive or indexing a document.
                 // we could fork a thread and do it right away but we try to minimize forking and piggyback on outside events.
                 shouldPeriodicallyFlushAfterBigMerge.set(true);
+            }
+            // Dispatch sidecar cleanup to FLUSH thread pool (same pattern as post-merge flush)
+            Runnable cleanupCallback = sidecarMergeCleanupCallback;
+            if (cleanupCallback != null) {
+                engineConfig.getThreadPool().executor(ThreadPool.Names.FLUSH).execute(new AbstractRunnable() {
+                    @Override
+                    public void onFailure(Exception e) {
+                        if (isClosed.get() == false) {
+                            logger.warn("sidecar cleanup after merge failed", e);
+                        }
+                    }
+
+                    @Override
+                    protected void doRun() {
+                        cleanupCallback.run();
+                    }
+                });
             }
         }
 

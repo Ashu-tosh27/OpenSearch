@@ -128,7 +128,10 @@ import org.opensearch.index.cache.IndexCache;
 import org.opensearch.index.cache.bitset.ShardBitsetFilterCache;
 import org.opensearch.index.cache.request.ShardRequestCache;
 import org.opensearch.index.codec.CodecService;
+import org.opensearch.index.compositeindex.datacube.startree.SidecarProtectedDirectory;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeField;
+import org.opensearch.index.compositeindex.datacube.startree.StarTreeSidecarMetadata;
+import org.opensearch.index.compositeindex.datacube.startree.StarTreeSidecarReader;
 import org.opensearch.index.compositeindex.datacube.startree.StarTreeUpgradeService;
 import org.opensearch.index.engine.CommitStats;
 import org.opensearch.index.engine.Engine;
@@ -242,6 +245,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CompletionService;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorCompletionService;
@@ -250,7 +254,6 @@ import java.util.concurrent.Semaphore;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.BiConsumer;
@@ -988,6 +991,18 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     private final AtomicBoolean primaryReplicaResyncInProgress = new AtomicBoolean();
 
     private final AtomicBoolean starTreeUpgradeInProgress = new AtomicBoolean();
+
+    /** Sidecar star tree metadata — loaded on shard start, mutated under sidecarMetadataLock */
+    private volatile StarTreeSidecarMetadata starTreeSidecarMetadata;
+
+    /** The sidecar-protected directory wrapper, if installed */
+    private volatile SidecarProtectedDirectory sidecarProtectedDirectory;
+
+    /** Lock for sidecar metadata mutations (in-memory state only, disk I/O outside lock) */
+    private final Object sidecarMetadataLock = new Object();
+
+    /** Cache of sidecar readers keyed by segment name */
+    private final ConcurrentHashMap<String, StarTreeSidecarReader> sidecarReaderCache = new ConcurrentHashMap<>();
 
     /**
      * Completes the relocation. Operations are blocked and current operations are drained before changing state to
@@ -2304,22 +2319,18 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
     }
 
     /**
-     * Upgrades this shard to use star tree indexing. Restarts the engine so the composite codec
-     * is selected, then runs a force merge to build star tree data from raw doc values.
-     *
-     * @throws IOException if an I/O error occurs during engine restart or force merge
-     * @throws InterruptedException if the calling thread is interrupted while blocking operations
-     * @throws TimeoutException if timed out waiting for in-flight operations to finish
-     */
-    /**
-     * Upgrades this shard's segments to use star tree indexes via per-segment building
-     * and direct SegmentInfos rewrite. No force merge is needed.
+     * Upgrades this shard's segments to use star tree indexes via the sidecar approach.
      * <p>
-     * Flow: flush → block operations → close engine → build star tree data per segment
-     * → rewrite SegmentInfos and .si files with Composite912Codec → create new engine → unblock.
+     * Sidecar approach: builds star tree files alongside existing segments WITHOUT modifying
+     * the segment's codec, .si file, or SegmentInfos. The engine stays live throughout the
+     * build phase — both reads and writes remain available. A brief engine restart at the end
+     * switches the codec for future segments.
      * <p>
-     * Reads and writes are unavailable during the upgrade. The upgrade builds star tree data
-     * by reading doc values from each segment and writing .cid/.cim/.cidvd/.cidvm files directly.
+     * This approach handles segments with soft deletes (which the codec-switching approach cannot)
+     * by filtering deleted docs via LiveDocsFilteredDocValuesProducer.
+     * <p>
+     * Flow: build sidecar files (engine live) → protect files → flush (drain translog) →
+     * block operations → set codec override → resetEngineToGlobalCheckpoint → unblock.
      *
      * @param starTreeField the star tree configuration (dimensions, metrics, build parameters)
      * @return the number of segments that were upgraded
@@ -2329,107 +2340,190 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         if (starTreeUpgradeInProgress.compareAndSet(false, true) == false) {
             throw new IllegalStateException("star tree upgrade already in progress on shard [" + shardId + "]");
         }
-        logger.info("{} starting per-segment star tree upgrade", shardId);
+        logger.info("{} starting sidecar star tree upgrade", shardId);
 
-        final AtomicInteger upgradedCount = new AtomicInteger(0);
         try {
-            // First flush: reduce work needed after blocking
-            flush(new FlushRequest().force(true));
+            // Flush FIRST so DirectoryReader.open() in the sidecar builder sees all committed segments
+            flush(new FlushRequest().force(true).waitIfOngoing(true));
 
-            indexShardOperationPermits.blockOperations(30, TimeUnit.MINUTES, () -> {
-                // blockOperations accepts CheckedRunnable<Exception> — IOException,
-                // InterruptedException, TimeoutException propagate unwrapped to caller.
-                // Second flush: ensure all data committed before engine close
-                // (catches any writes between first flush and block)
-                flush(new FlushRequest().waitIfOngoing(true));
+            // Phase 1: Build sidecar files — engine stays LIVE, reads + writes available
+            if (starTreeSidecarMetadata == null) {
+                starTreeSidecarMetadata = new StarTreeSidecarMetadata();
+            }
+            int upgraded = StarTreeUpgradeService.buildSidecarStarTreeData(
+                store().directory(),
+                starTreeField,
+                mapperService,
+                starTreeSidecarMetadata
+            );
 
-                // --- Swap 1: InternalEngine → ReadOnlyEngine ---
-                // Pattern: create ROE first, then swap reference, then close old engine.
-                // If ROE constructor throws, old engine is still current — no damage.
-                synchronized (engineMutex) {
-                    Engine oldEngine = currentEngineReference.get();
-                    ReadOnlyEngine roEngine = new ReadOnlyEngine(
-                        newEngineConfig(replicationTracker), // uses stale codec — fine, ROE only reads
-                        null,  // seqNoStats — ROE will build from commit
-                        null,  // translogStats — ROE will build from commit
-                        false, // obtainLock=false so Phase 2 can acquire write lock
-                        Function.identity(), // no reader wrapping needed
-                        false  // requireCompleteHistory=false
-                    );
-                    currentEngineReference.set(roEngine);
-                    IOUtils.close(oldEngine);
-                    // Set codecServiceOverride INSIDE mutex, AFTER old engine is closed.
-                    // This prevents a race where concurrent newEngineConfig() calls see the
-                    // override while the old InternalEngine is still active.
-                    codecServiceOverride = engineConfigFactory.newDefaultCodecService(indexSettings, mapperService, logger);
-                }
-
-                // Track ALL candidate segments (not just successful) for cleanup on failure.
-                Set<String> allCandidateSegments = StarTreeUpgradeService.getCandidateSegmentNames(store().directory());
-                Set<String> upgradedSegments = Collections.emptySet();
-                try {
-                    // Phase 1: build star tree files
-                    upgradedSegments = StarTreeUpgradeService.buildStarTreeDataForSegments(
+            // Update protected directory with new sidecar files
+            if (upgraded > 0) {
+                if (sidecarProtectedDirectory == null) {
+                    // First upgrade on this shard — install the protected directory wrapper
+                    SidecarProtectedDirectory wrapper = new SidecarProtectedDirectory(
                         store().directory(),
-                        starTreeField,
-                        mapperService
+                        starTreeSidecarMetadata.getAllSidecarFileNames()
                     );
-                    // Phase 2: rewrite SegmentInfos (if any segments upgraded)
-                    if (upgradedSegments.isEmpty() == false) {
-                        StarTreeUpgradeService.rewriteSegmentInfos(store().directory(), upgradedSegments);
-                    }
-                    upgradedCount.set(upgradedSegments.size());
-                } catch (Exception e) {
-                    // Cleanup ALL candidate segments' star tree files, not just successful ones.
-                    StarTreeUpgradeService.cleanupStarTreeFiles(store().directory(), allCandidateSegments);
-                    throw e;
+                    store().installSidecarDirectory(wrapper);
+                    sidecarProtectedDirectory = wrapper;
+                } else {
+                    sidecarProtectedDirectory.protect(starTreeSidecarMetadata.getAllSidecarFileNames());
                 }
+            }
 
-                // --- Swap 2: ReadOnlyEngine → InternalEngine (with recovery) ---
-                Engine newEngine;
-                try {
-                    synchronized (engineMutex) {
-                        Engine roEngine = currentEngineReference.get();
-                        newEngine = engineFactory.newReadWriteEngine(newEngineConfig(replicationTracker));
-                        onNewEngine(newEngine);
-                        currentEngineReference.set(newEngine);
-                        IOUtils.close(roEngine);
-                    }
-                } catch (Exception e) {
-                    logger.error("Failed to open new InternalEngine after upgrade, attempting recovery", e);
-                    try {
-                        // Recovery: try with original codec (clear override)
-                        codecServiceOverride = null;
-                        synchronized (engineMutex) {
-                            Engine roEngine = currentEngineReference.get();
-                            newEngine = engineFactory.newReadWriteEngine(newEngineConfig(replicationTracker));
-                            onNewEngine(newEngine);
-                            currentEngineReference.set(newEngine);
-                            IOUtils.close(roEngine);
-                        }
-                    } catch (Exception fatal) {
-                        logger.error("Recovery engine also failed — shard is unusable", fatal);
-                        failShard("star tree upgrade engine recovery failed", fatal);
-                        throw fatal;
-                    }
-                }
-                // Refresh outside engineMutex — non-fatal if it fails.
-                try {
-                    newEngine.refresh("star-tree-upgrade");
-                } catch (Exception e) {
-                    logger.warn("Post-upgrade refresh failed, will retry on next cycle", e);
-                }
-                active.set(true);
-                // NOTE: codecServiceOverride is NOT cleared here — kept for resetEngineToGlobalCheckpoint().
-                // It will be nulled after the first post-upgrade engine reset confirms the persistent
-                // index.composite_index=true setting took effect.
-            });
+            // Populate sidecar reader cache for immediate star tree acceleration
+            populateSidecarReaderCache();
 
-            logger.info("{} per-segment star tree upgrade completed — {} segments upgraded", shardId, upgradedCount.get());
-        } finally {
+            // Wire sidecar cleanup callback if not already wired
+            Engine engine = getEngineOrNull();
+            if (engine instanceof InternalEngine && starTreeSidecarMetadata.isEmpty() == false) {
+                ((InternalEngine) engine).setSidecarMergeCleanupCallback(this::performSidecarCleanup);
+            }
+
+            logger.info("{} sidecar star tree upgrade completed — {} segments with star tree data", shardId, upgraded);
+            return upgraded;
+        } catch (Exception e) {
+            // Clear the flag on failure so this shard can be retried independently.
             starTreeUpgradeInProgress.set(false);
+            throw e;
         }
-        return upgradedCount.get();
+    }
+
+    /**
+     * Returns whether a star tree upgrade is currently in progress on this shard.
+     * Used by {@code StarTreeQueryHelper.isStarTreeSupported()} to skip star tree
+     * acceleration during the upgrade window, preventing result divergence between
+     * primary and replicas.
+     */
+    public boolean isStarTreeUpgradeInProgress() {
+        return starTreeUpgradeInProgress.get();
+    }
+
+    /**
+     * Clears the star tree upgrade in progress flag. Called by TransportStarTreeUpgradeAction
+     * after ALL shard upgrades complete across all nodes.
+     */
+    public void clearStarTreeUpgradeInProgress() {
+        starTreeUpgradeInProgress.set(false);
+    }
+
+    /**
+     * Returns the sidecar star tree metadata for this shard.
+     */
+    public StarTreeSidecarMetadata getStarTreeSidecarMetadata() {
+        return starTreeSidecarMetadata;
+    }
+
+    /**
+     * Returns the cache of sidecar readers keyed by segment name.
+     */
+    public ConcurrentHashMap<String, StarTreeSidecarReader> getSidecarReaderCache() {
+        return sidecarReaderCache;
+    }
+
+    /**
+     * Populates the sidecar reader cache from the current sidecar metadata.
+     * Creates a {@link StarTreeSidecarReader} for each segment that has sidecar star tree data
+     * and is not already cached. Called after upgrade build and on shard start.
+     */
+    private void populateSidecarReaderCache() {
+        StarTreeSidecarMetadata metadata = starTreeSidecarMetadata;
+        if (metadata == null || metadata.isEmpty()) {
+            return;
+        }
+        SidecarProtectedDirectory spd = sidecarProtectedDirectory;
+        if (spd == null) {
+            logger.debug("Skipping sidecar reader cache population: SidecarProtectedDirectory not installed");
+            return;
+        }
+        try {
+            // Read SegmentInfos to get segment IDs for header validation
+            SegmentInfos segmentInfos = SegmentInfos.readLatestCommit(store().directory());
+            Map<String, byte[]> segmentIdMap = new java.util.HashMap<>();
+            Map<String, Integer> segmentMaxDocMap = new java.util.HashMap<>();
+            for (SegmentCommitInfo ci : segmentInfos) {
+                segmentIdMap.put(ci.info.name, ci.info.getId());
+                segmentMaxDocMap.put(ci.info.name, ci.info.maxDoc());
+            }
+
+            for (String segName : metadata.getSegmentNames()) {
+                if (sidecarReaderCache.containsKey(segName) == false) {
+                    byte[] segId = segmentIdMap.get(segName);
+                    Integer maxDoc = segmentMaxDocMap.get(segName);
+                    if (segId == null || maxDoc == null) {
+                        logger.debug("Segment [{}] not found in SegmentInfos, skipping sidecar reader creation", segName);
+                        continue;
+                    }
+                    try {
+                        Set<String> files = metadata.getStarTreeFiles(segName);
+                        StarTreeSidecarReader reader = new StarTreeSidecarReader(store().directory(), segName, files, spd, segId, maxDoc);
+                        sidecarReaderCache.put(segName, reader);
+                    } catch (Exception e) {
+                        logger.warn("Failed to create sidecar reader for segment [{}], skipping", segName, e);
+                    }
+                }
+            }
+            logger.info("Populated sidecar reader cache with {} entries", sidecarReaderCache.size());
+        } catch (Exception e) {
+            logger.warn("Failed to read SegmentInfos for sidecar reader cache population", e);
+        }
+    }
+
+    /**
+     * Performs sidecar star tree cleanup by comparing metadata against current SegmentInfos.
+     * Called from the FLUSH thread pool after a merge completes.
+     * <p>
+     * This is the primary cleanup mechanism, triggered after every merge. For periodic cleanup
+     * (e.g., to catch orphans missed by merge-triggered cleanup), this method can also be called
+     * from a refresh listener. The merge-triggered path is sufficient for normal operation since
+     * merges are the only operation that removes segments.
+     * <p>
+     * TODO: Wire into refresh listener for periodic orphan cleanup if merge-triggered cleanup
+     * proves insufficient in edge cases (e.g., crash recovery leaving stale entries).
+     */
+    private void performSidecarCleanup() {
+        StarTreeSidecarMetadata metadata = starTreeSidecarMetadata;
+        if (metadata == null || metadata.isEmpty()) {
+            return;
+        }
+        try {
+            SegmentInfos currentInfos = SegmentInfos.readLatestCommit(store().directory());
+            boolean changed = false;
+
+            synchronized (sidecarMetadataLock) {
+                Set<String> orphanedFiles = metadata.removeOrphanedSegments(currentInfos);
+                if (orphanedFiles.isEmpty() == false) {
+                    changed = true;
+                    // Mark readers for deferred deletion
+                    for (String segName : new HashSet<>(sidecarReaderCache.keySet())) {
+                        if (metadata.hasStarTreeData(segName) == false) {
+                            StarTreeSidecarReader reader = sidecarReaderCache.remove(segName);
+                            if (reader != null) {
+                                reader.markPendingDeletion();
+                                try {
+                                    reader.decRef();
+                                } catch (Exception e) {
+                                    logger.warn("Failed to decRef sidecar reader", e);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Disk I/O outside lock
+            if (changed) {
+                metadata.commit(store().directory());
+                // Update protected directory
+                if (sidecarProtectedDirectory != null) {
+                    sidecarProtectedDirectory.protect(metadata.getAllSidecarFileNames());
+                    // Note: unprotect happens inside StarTreeSidecarReader.deleteFiles() at refCount=0
+                }
+            }
+        } catch (Exception e) {
+            logger.warn("Sidecar cleanup after merge failed", e);
+        }
     }
 
     public MergedSegmentTransferTracker mergedSegmentTransferTracker() {
@@ -2990,6 +3084,30 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
         if (state != IndexShardState.RECOVERING) {
             throw new IndexShardNotRecoveringException(shardId, state);
         }
+
+        // Load sidecar metadata and install protected directory wrapper before engine creation.
+        // This ensures IndexWriter's crash recovery doesn't delete sidecar star tree files.
+        try {
+            starTreeSidecarMetadata = StarTreeSidecarMetadata.load(store().directory());
+            if (starTreeSidecarMetadata.isEmpty() == false) {
+                Set<String> protectedFiles = starTreeSidecarMetadata.getAllSidecarFileNames();
+                SidecarProtectedDirectory wrapper = new SidecarProtectedDirectory(store().directory(), protectedFiles);
+                store().installSidecarDirectory(wrapper);
+                sidecarProtectedDirectory = wrapper;
+                logger.info(
+                    "Installed SidecarProtectedDirectory with {} protected files for {} segments",
+                    protectedFiles.size(),
+                    starTreeSidecarMetadata.getSegmentNames().size()
+                );
+            }
+        } catch (Exception e) {
+            logger.warn("Failed to load sidecar metadata, proceeding without sidecar protection", e);
+            starTreeSidecarMetadata = new StarTreeSidecarMetadata();
+        }
+
+        // Populate sidecar reader cache for immediate star tree acceleration on shard start
+        populateSidecarReaderCache();
+
         final EngineConfig config = newEngineConfig(globalCheckpointSupplier);
 
         // we disable deletes since we allow for operations to be executed against the shard while recovering
@@ -3044,6 +3162,11 @@ public class IndexShard extends AbstractIndexShardComponent implements IndicesCl
             final Engine newEngine = engineFactory.newReadWriteEngine(config);
             onNewEngine(newEngine);
             currentEngineReference.set(newEngine);
+
+            // Wire sidecar cleanup callback if sidecar metadata is present
+            if (newEngine instanceof InternalEngine && starTreeSidecarMetadata != null && starTreeSidecarMetadata.isEmpty() == false) {
+                ((InternalEngine) newEngine).setSidecarMergeCleanupCallback(this::performSidecarCleanup);
+            }
 
             if (indexSettings.isSegRepEnabledOrRemoteNode()) {
                 // set initial replication checkpoints into tracker.

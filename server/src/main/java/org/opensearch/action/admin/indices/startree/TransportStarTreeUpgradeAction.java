@@ -180,6 +180,15 @@ public class TransportStarTreeUpgradeAction extends TransportBroadcastByNodeActi
             throw new IOException("star tree upgrade interrupted on shard [" + shardRouting.shardId() + "]", e);
         } catch (java.util.concurrent.TimeoutException e) {
             throw new IOException("star tree upgrade timed out on shard [" + shardRouting.shardId() + "]", e);
+        } finally {
+            // Clear the flag after this shard's upgrade completes (success or failure).
+            // The flag was set at the start of upgradeToStarTree().
+            // On failure, upgradeToStarTree() already cleared it in its catch block,
+            // but clearing again is idempotent and safe.
+            // All shards clear their flags independently after their upgrade completes.
+            // The transport action's response arrives only after ALL shardOperations
+            // complete, so from the caller's perspective all shards finish atomically.
+            indexShard.clearStarTreeUpgradeInProgress();
         }
         return new ShardStarTreeUpgradeResult(shardRouting.shardId(), shardRouting.primary());
     }
@@ -526,9 +535,7 @@ public class TransportStarTreeUpgradeAction extends TransportBroadcastByNodeActi
                 // Also set composite_index=true so that subsequent CodecService instances include
                 // Composite912Codec without needing the volatile codecServiceOverride.
                 boolean needAppendOnly = IndexMetadata.INDEX_APPEND_ONLY_ENABLED_SETTING.get(indexMetadata.getSettings()) == false;
-                boolean needCompositeIndex = StarTreeIndexSettings.IS_COMPOSITE_INDEX_SETTING.get(
-                    indexMetadata.getSettings()
-                ) == false;
+                boolean needCompositeIndex = StarTreeIndexSettings.IS_COMPOSITE_INDEX_SETTING.get(indexMetadata.getSettings()) == false;
                 if (needAppendOnly || needCompositeIndex) {
                     Settings.Builder settingsBuilder = Settings.builder().put(indexMetadata.getSettings());
                     if (needAppendOnly) {

@@ -38,6 +38,7 @@ import org.opensearch.index.codec.composite.LuceneDocValuesProducerFactory;
 import org.opensearch.index.compositeindex.CompositeIndexMetadata;
 import org.opensearch.index.compositeindex.datacube.Metric;
 import org.opensearch.index.compositeindex.datacube.MetricStat;
+import org.opensearch.index.compositeindex.datacube.startree.StarTreeValuesProvider;
 import org.opensearch.index.compositeindex.datacube.startree.fileformats.meta.DimensionConfig;
 import org.opensearch.index.compositeindex.datacube.startree.fileformats.meta.StarTreeMetadata;
 import org.opensearch.index.compositeindex.datacube.startree.index.CompositeIndexValues;
@@ -63,7 +64,7 @@ import static org.opensearch.index.compositeindex.datacube.startree.utils.StarTr
  * @opensearch.experimental
  */
 @ExperimentalApi
-public class Composite912DocValuesReader extends DocValuesProducer implements CompositeIndexReader {
+public class Composite912DocValuesReader extends DocValuesProducer implements CompositeIndexReader, StarTreeValuesProvider {
     private static final Logger logger = LogManager.getLogger(Composite912DocValuesReader.class);
 
     private final DocValuesProducer delegate;

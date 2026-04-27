@@ -1369,7 +1369,7 @@ public abstract class Engine implements LifecycleAware, Closeable {
         if (store.shouldSetParentField()) {
             iwc.setParentField(Lucene.PARENT_FIELD);
         }
-        try (IndexWriter writer = new IndexWriter(store.directory(), iwc)) {
+        try (IndexWriter writer = new IndexWriter(store.engineDirectory(), iwc)) {
             // do nothing except increasing metric count and close this will kick off IndexFileDeleter which will
             // remove all unreferenced files
             totalUnreferencedFileCleanUpsPerformed.inc();

@@ -33,6 +33,8 @@
 package org.opensearch.search.aggregations.bucket.terms;
 
 import joptsimple.internal.Strings;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.DocValues;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReaderContext;
@@ -99,6 +101,7 @@ import static org.apache.lucene.index.SortedSetDocValues.NO_MORE_DOCS;
  * @opensearch.internal
  */
 public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggregator implements StarTreePreComputeCollector {
+    private static final Logger logger = LogManager.getLogger(GlobalOrdinalsStringTermsAggregator.class);
     protected final ResultStrategy<?, ?, ?> resultStrategy;
     protected final ValuesSource.Bytes.WithOrdinals valuesSource;
 
@@ -379,7 +382,7 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
         CompositeIndexFieldInfo starTree,
         StarTreeBucketCollector parent
     ) throws IOException {
-        StarTreeValues starTreeValues = StarTreeQueryHelper.getStarTreeValues(ctx, starTree);
+        StarTreeValues starTreeValues = StarTreeQueryHelper.getStarTreeValues(ctx, starTree, context);
         if (starTreeValues == null) {
             return null; // segment doesn't have star tree data
         }
@@ -394,9 +397,11 @@ public class GlobalOrdinalsStringTermsAggregator extends AbstractStringTermsAggr
         if (parent != null && !(collectionStrategy instanceof RemapGlobalOrdsStarTree)) {
             collectionStrategy.close();
             collectionStrategy = new RemapGlobalOrdsStarTree(this.cardinalityUpperBound);
-            SortedSetDocValues globalOrds = valuesSource.globalOrdinalsValues(ctx);
-            collectionStrategy.globalOrdsReady(globalOrds);
         }
+        // Always initialize globalOrds for the collection strategy — the star tree precompute
+        // path skips getLeafCollector() which normally calls globalOrdsReady().
+        SortedSetDocValues globalOrds = valuesSource.globalOrdinalsValues(ctx);
+        collectionStrategy.globalOrdsReady(globalOrds);
 
         LongUnaryOperator globalOperator = valuesSource.globalOrdinalsMapping(ctx);
         return new StarTreeBucketCollector(

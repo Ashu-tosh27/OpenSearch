@@ -371,7 +371,7 @@ public class StarTreeFilterTests extends AggregatorTestCase {
     ) throws IOException {
         List<CompositeIndexFieldInfo> compositeIndexFields = starTreeDocValuesReader.getCompositeIndexFields();
         CompositeIndexFieldInfo starTree = compositeIndexFields.get(0);
-        StarTreeValues starTreeValues = StarTreeQueryHelper.getStarTreeValues(context, starTree);
+        StarTreeValues starTreeValues = StarTreeQueryHelper.getStarTreeValues(context, starTree, searchContext);
         FixedBitSet filteredValues = StarTreeTraversalUtil.getStarTreeResult(starTreeValues, starTreeFilter, searchContext);
 
         SortedNumericStarTreeValuesIterator valuesIterator = (SortedNumericStarTreeValuesIterator) starTreeValues.getMetricValuesIterator(

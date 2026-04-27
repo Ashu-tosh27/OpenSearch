@@ -8,15 +8,19 @@
 
 package org.opensearch.search.startree;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.SegmentReader;
 import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.store.AlreadyClosedException;
 import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.common.lucene.Lucene;
 import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.codec.composite.CompositeIndexReader;
 import org.opensearch.index.compositeindex.datacube.Dimension;
 import org.opensearch.index.compositeindex.datacube.MetricStat;
+import org.opensearch.index.compositeindex.datacube.startree.StarTreeSidecarReader;
 import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValues;
 import org.opensearch.index.compositeindex.datacube.startree.utils.StarTreeUtils;
 import org.opensearch.index.compositeindex.datacube.startree.utils.iterator.SortedNumericStarTreeValuesIterator;
@@ -36,6 +40,7 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -47,11 +52,18 @@ import java.util.function.Consumer;
  */
 public class StarTreeQueryHelper {
 
+    private static final Logger logger = LogManager.getLogger(StarTreeQueryHelper.class);
+
     /**
-     * Checks if the search context can be supported by star-tree
+     * Checks if the search context can be supported by star-tree.
+     * Returns false if the shard has a star tree upgrade in progress, to prevent
+     * result divergence between primary and replicas during the upgrade window.
      */
     public static boolean isStarTreeSupported(SearchContext context) {
-        return context.aggregations() != null && context.mapperService().isCompositeIndexPresent() && context.parsedPostFilter() == null;
+        return context.aggregations() != null
+            && context.mapperService().isCompositeIndexPresent()
+            && context.parsedPostFilter() == null
+            && context.indexShard().isStarTreeUpgradeInProgress() == false;
     }
 
     public static CompositeIndexFieldInfo getSupportedStarTree(QueryShardContext context) {
@@ -59,12 +71,47 @@ public class StarTreeQueryHelper {
         return (starTreeQueryContext != null) ? starTreeQueryContext.getStarTree() : null;
     }
 
-    public static StarTreeValues getStarTreeValues(LeafReaderContext context, CompositeIndexFieldInfo starTree) throws IOException {
+    public static StarTreeValues getStarTreeValues(LeafReaderContext context, CompositeIndexFieldInfo starTree, SearchContext searchContext)
+        throws IOException {
         SegmentReader reader = Lucene.segmentReader(context.reader());
-        if (!(reader.getDocValuesReader() instanceof CompositeIndexReader starTreeDocValuesReader)) {
-            return null;
+
+        // Path 1: Native composite segment (existing path, unchanged)
+        if (reader.getDocValuesReader() instanceof CompositeIndexReader starTreeDocValuesReader) {
+            return (StarTreeValues) starTreeDocValuesReader.getCompositeIndexValues(starTree);
         }
-        return (StarTreeValues) starTreeDocValuesReader.getCompositeIndexValues(starTree);
+
+        // Path 2: Sidecar segment — look up cached sidecar reader by segment name
+        if (searchContext != null) {
+            ConcurrentHashMap<String, StarTreeSidecarReader> cache = searchContext.indexShard().getSidecarReaderCache();
+            if (cache != null && cache.isEmpty() == false) {
+                String segmentName = reader.getSegmentName();
+                StarTreeSidecarReader sidecarReader = cache.get(segmentName);
+                if (sidecarReader != null) {
+                    try {
+                        sidecarReader.incRef();
+                    } catch (AlreadyClosedException e) {
+                        cache.remove(segmentName, sidecarReader);
+                        return null;
+                    }
+                    try {
+                        return (StarTreeValues) sidecarReader.getCompositeIndexValues(starTree);
+                    } catch (Exception e) {
+                        logger.warn("Failed to get star tree values from sidecar reader for segment [{}]", segmentName, e);
+                        sidecarReader.decRef();
+                        return null;
+                    }
+                    // Note: we intentionally do NOT decRef() here. The returned StarTreeValues holds
+                    // references to IndexInput slices from the sidecar reader. The cache holds the base
+                    // reference (refCount=1), and this incRef() keeps the reader alive for the duration
+                    // of the aggregation. The extra ref is released when the search context closes or
+                    // when the sidecar reader is evicted from cache during merge cleanup.
+                    // In practice, the cache reference alone is sufficient since merge cleanup uses
+                    // markPendingDeletion() + decRef() which defers file deletion until refCount=0.
+                }
+            }
+        }
+
+        return null;
     }
 
     /**
@@ -80,7 +127,7 @@ public class StarTreeQueryHelper {
         Consumer<Long> valueConsumer,
         Runnable finalConsumer
     ) throws IOException {
-        StarTreeValues starTreeValues = getStarTreeValues(ctx, starTree);
+        StarTreeValues starTreeValues = getStarTreeValues(ctx, starTree, context);
         if (starTreeValues == null) {
             return false; // segment doesn't have star tree data, caller should fall back
         }

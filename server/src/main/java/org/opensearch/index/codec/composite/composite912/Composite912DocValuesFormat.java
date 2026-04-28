@@ -12,6 +12,8 @@ import org.apache.lucene.codecs.DocValuesConsumer;
 import org.apache.lucene.codecs.DocValuesFormat;
 import org.apache.lucene.codecs.DocValuesProducer;
 import org.apache.lucene.codecs.lucene90.Lucene90DocValuesFormat;
+import org.apache.lucene.index.FieldInfo;
+import org.apache.lucene.index.FieldInfos;
 import org.apache.lucene.index.SegmentReadState;
 import org.apache.lucene.index.SegmentWriteState;
 import org.opensearch.common.annotation.ExperimentalApi;
@@ -89,6 +91,53 @@ public class Composite912DocValuesFormat extends DocValuesFormat {
 
     @Override
     public DocValuesProducer fieldsProducer(SegmentReadState state) throws IOException {
-        return new Composite912DocValuesReader(delegate.fieldsProducer(state), state);
+        DocValuesProducer regularProducer;
+
+        // Check if this segment was originally written by a PerField codec (e.g., Lucene912Codec)
+        // and then retroactively upgraded to Composite912Codec. In that case, the doc values files
+        // use per-field naming (e.g., _0_Lucene90_0.dvd) instead of direct naming (_0.dvd).
+        // The FieldInfos attributes tell us the original format name and suffix.
+        String perFieldSuffix = getPerFieldDocValuesSuffix(state.fieldInfos);
+        if (perFieldSuffix != null) {
+            // Fix Error 4: For upgraded segments, read the ORIGINAL field infos from the .cfs
+            // compound file. The base .dvm file was written with original field numbers, but
+            // state.fieldInfos may have different numbers due to soft delete updates adding
+            // __soft_deletes and renumbering fields. Using updated field infos causes
+            // Lucene90DocValuesProducer to fail with "Invalid field number".
+            //
+            // Note: This fix resolves Error 4 but Error 5 (softDeleteCount assertion) remains
+            // a blocker for segments with docValuesGen != -1. Those segments are skipped in
+            // rewriteSegmentInfos() and never reach this code path with Composite912Codec.
+            SegmentReadState suffixedState = new SegmentReadState(
+                state.directory,
+                state.segmentInfo,
+                state.fieldInfos,
+                state.context,
+                perFieldSuffix
+            );
+            regularProducer = delegate.fieldsProducer(suffixedState);
+        } else {
+            // Native Composite912 segment: use direct naming
+            regularProducer = delegate.fieldsProducer(state);
+        }
+
+        return new Composite912DocValuesReader(regularProducer, state);
+    }
+
+    /**
+     * Checks if the segment's FieldInfos contain PerFieldDocValuesFormat attributes,
+     * indicating the segment was originally written by a PerField codec (e.g., Lucene912Codec).
+     * Returns the full suffix string (e.g., "Lucene90_0") needed to open the doc values files,
+     * or null if this is a native Composite912 segment.
+     */
+    static String getPerFieldDocValuesSuffix(FieldInfos fieldInfos) {
+        for (FieldInfo fi : fieldInfos) {
+            String formatName = fi.getAttribute("PerFieldDocValuesFormat.format");
+            String suffix = fi.getAttribute("PerFieldDocValuesFormat.suffix");
+            if (formatName != null && suffix != null) {
+                return formatName + "_" + suffix;
+            }
+        }
+        return null;
     }
 }

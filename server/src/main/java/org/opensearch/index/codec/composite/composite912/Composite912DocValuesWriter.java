@@ -8,6 +8,8 @@
 
 package org.opensearch.index.codec.composite.composite912;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 import org.apache.lucene.codecs.CodecUtil;
 import org.apache.lucene.codecs.DocValuesConsumer;
 import org.apache.lucene.codecs.DocValuesProducer;
@@ -25,11 +27,14 @@ import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.search.DocIdSetIterator;
 import org.apache.lucene.store.IndexOutput;
+import org.apache.lucene.util.Bits;
+import org.apache.lucene.util.FixedBitSet;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.util.io.IOUtils;
 import org.opensearch.index.codec.composite.CompositeIndexFieldInfo;
 import org.opensearch.index.codec.composite.CompositeIndexReader;
 import org.opensearch.index.codec.composite.LuceneDocValuesConsumerFactory;
+import org.opensearch.index.compositeindex.datacube.startree.LiveDocsFilteredDocValuesProducer;
 import org.opensearch.index.compositeindex.datacube.startree.builder.StarTreesBuilder;
 import org.opensearch.index.compositeindex.datacube.startree.index.CompositeIndexValues;
 import org.opensearch.index.compositeindex.datacube.startree.index.StarTreeValues;
@@ -60,6 +65,7 @@ import java.util.concurrent.atomic.AtomicReference;
  */
 @ExperimentalApi
 public class Composite912DocValuesWriter extends DocValuesConsumer {
+    private static final Logger logger = LogManager.getLogger(Composite912DocValuesWriter.class);
     private final DocValuesConsumer delegate;
     private final SegmentWriteState state;
     private final MapperService mapperService;
@@ -67,6 +73,10 @@ public class Composite912DocValuesWriter extends DocValuesConsumer {
     private final Set<CompositeMappedFieldType> compositeMappedFieldTypes;
     private final Set<String> compositeFieldSet;
     private DocValuesConsumer compositeDocValuesConsumer;
+
+    // Captured during merge to build live docs bitset for soft-delete filtering
+    private DocValuesProducer softDeletesProducer;
+    private FieldInfo softDeletesFieldInfo;
 
     public IndexOutput dataOut;
     public IndexOutput metaOut;
@@ -169,6 +179,11 @@ public class Composite912DocValuesWriter extends DocValuesConsumer {
         if (mergeState.get() != null) {
             if (compositeFieldSet.contains(field.name)) {
                 mergedFieldProducerMap.put(field.name, valuesProducer);
+            }
+            // Capture __soft_deletes producer for merge-path live docs filtering
+            if ("__soft_deletes".equals(field.name)) {
+                softDeletesProducer = valuesProducer;
+                softDeletesFieldInfo = field;
             }
         }
     }
@@ -392,8 +407,27 @@ public class Composite912DocValuesWriter extends DocValuesConsumer {
             }
             if (hasAllCompositeFields) {
                 Map<String, DocValuesProducer> fieldProducerMapForMerge = buildFieldProducerMapFromMergeState(mergeState);
+                // Build live docs bitset from __soft_deletes field captured during super.merge().
+                // mergeState.liveDocs only has hard deletes — soft deletes must be read from
+                // the __soft_deletes doc values field.
+                FixedBitSet mergedLiveDocs = buildSoftDeleteLiveDocsBitset();
+                Map<String, DocValuesProducer> buildProducerMap;
+                if (mergedLiveDocs != null) {
+                    buildProducerMap = new HashMap<>();
+                    for (Map.Entry<String, DocValuesProducer> entry : fieldProducerMapForMerge.entrySet()) {
+                        // Skip-only mode: no remapping, no advanceExact
+                        buildProducerMap.put(entry.getKey(),
+                            new LiveDocsFilteredDocValuesProducer(entry.getValue(), mergedLiveDocs));
+                    }
+                } else {
+                    buildProducerMap = fieldProducerMapForMerge;
+                }
+                // Don't adjust SegmentWriteState maxDoc — the star tree builder iterates
+                // by calling nextDoc() on producers. The skip-only wrapper will return
+                // NO_MORE_DOCS after all live docs are consumed. The builder handles
+                // sparse fields (docs without values) by using default/null values.
                 try (StarTreesBuilder starTreesBuilder = new StarTreesBuilder(state, mapperService, fieldNumberAcrossCompositeFields)) {
-                    starTreesBuilder.build(metaOut, dataOut, fieldProducerMapForMerge, compositeDocValuesConsumer);
+                    starTreesBuilder.build(metaOut, dataOut, buildProducerMap, compositeDocValuesConsumer);
                 }
             } else {
                 try (StarTreesBuilder starTreesBuilder = new StarTreesBuilder(state, mapperService, fieldNumberAcrossCompositeFields)) {
@@ -431,6 +465,106 @@ public class Composite912DocValuesWriter extends DocValuesConsumer {
         }
 
         return resultMap;
+    }
+
+    /**
+     * Builds a live docs bitset from the __soft_deletes field captured during merge.
+     * Returns null if no soft deletes exist (all docs are live).
+     */
+    private FixedBitSet buildSoftDeleteLiveDocsBitset() throws IOException {
+        if (softDeletesProducer == null) {
+            return null; // no __soft_deletes field written → all docs live
+        }
+
+        int mergedMaxDoc = this.mergeState.get().segmentInfo.maxDoc();
+        FixedBitSet liveBits = new FixedBitSet(mergedMaxDoc);
+        liveBits.set(0, mergedMaxDoc); // start: all live
+
+        // Iterate __soft_deletes: docs with value=1 are soft-deleted
+        NumericDocValues softDelDV = softDeletesProducer.getNumeric(softDeletesFieldInfo);
+        int doc;
+        int softDelCount = 0;
+        while ((doc = softDelDV.nextDoc()) != DocIdSetIterator.NO_MORE_DOCS) {
+            if (softDelDV.longValue() == 1) {
+                if (doc < mergedMaxDoc) {
+                    liveBits.clear(doc);
+                }
+                softDelCount++;
+            }
+        }
+        logger.debug("buildSoftDeleteLiveDocsBitset: mergedMaxDoc={} softDelCount={} liveCardinality={}",
+            mergedMaxDoc, softDelCount, liveBits.cardinality());
+
+        // If all docs are live, return null (no filtering needed)
+        if (liveBits.cardinality() == mergedMaxDoc) {
+            return null;
+        }
+
+        return liveBits;
+    }
+
+    /**
+     * Builds a live docs bitset for the merged output by combining per-source liveDocs
+     * through docMaps. Returns null if all docs are live (no filtering needed).
+     * NOTE: This only handles HARD deletes. For soft deletes, use buildSoftDeleteLiveDocsBitset().
+     */
+    private static FixedBitSet buildMergedLiveDocsBitset(MergeState mergeState) {
+        // Check if any source segment has deleted docs
+        boolean anyDeletes = false;
+        for (int i = 0; i < mergeState.liveDocs.length; i++) {
+            if (mergeState.liveDocs[i] != null) {
+                anyDeletes = true;
+                break;
+            }
+        }
+        if (anyDeletes == false) {
+            return null; // all docs live — no filtering needed
+        }
+
+        int mergedMaxDoc = 0;
+        for (int i = 0; i < mergeState.maxDocs.length; i++) {
+            mergedMaxDoc += mergeState.maxDocs[i];
+        }
+        FixedBitSet liveBits = new FixedBitSet(mergedMaxDoc);
+        // Start with all docs marked live
+        liveBits.set(0, mergedMaxDoc);
+
+        // For each source segment, map deleted source doc IDs → merged doc IDs → clear
+        for (int segIdx = 0; segIdx < mergeState.liveDocs.length; segIdx++) {
+            Bits sourceLiveDocs = mergeState.liveDocs[segIdx];
+            if (sourceLiveDocs == null) {
+                continue; // all live in this source segment
+            }
+
+            MergeState.DocMap docMap = mergeState.docMaps[segIdx];
+            int sourceMaxDoc = mergeState.maxDocs[segIdx];
+
+            for (int sourceDocId = 0; sourceDocId < sourceMaxDoc; sourceDocId++) {
+                if (sourceLiveDocs.get(sourceDocId) == false) {
+                    int mergedDocId = docMap.get(sourceDocId);
+                    if (mergedDocId != -1) {
+                        liveBits.clear(mergedDocId);
+                    }
+                }
+            }
+        }
+        return liveBits;
+    }
+
+    /**
+     * Wraps each DocValuesProducer in the map with a LiveDocsFilteredDocValuesProducer
+     * that filters out soft-deleted documents.
+     */
+    private static Map<String, DocValuesProducer> wrapWithLiveDocsFilter(
+        Map<String, DocValuesProducer> producerMap,
+        FixedBitSet liveDocs,
+        int maxDoc
+    ) {
+        Map<String, DocValuesProducer> filtered = new HashMap<>();
+        for (Map.Entry<String, DocValuesProducer> entry : producerMap.entrySet()) {
+            filtered.put(entry.getKey(), new LiveDocsFilteredDocValuesProducer(entry.getValue(), liveDocs, maxDoc));
+        }
+        return filtered;
     }
 
     private static SegmentWriteState getSegmentWriteState(SegmentWriteState segmentWriteState) {

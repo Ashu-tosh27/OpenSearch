@@ -26,7 +26,9 @@ import org.apache.lucene.index.SortedDocValues;
 import org.apache.lucene.index.SortedNumericDocValues;
 import org.apache.lucene.index.SortedSetDocValues;
 import org.apache.lucene.store.ChecksumIndexInput;
+import org.apache.lucene.store.Directory;
 import org.apache.lucene.store.FileTypeHint;
+import org.apache.lucene.store.IOContext;
 import org.apache.lucene.store.IndexInput;
 import org.opensearch.common.annotation.ExperimentalApi;
 import org.opensearch.common.util.io.IOUtils;
@@ -77,30 +79,58 @@ public class Composite912DocValuesReader extends DocValuesProducer implements Co
         this.delegate = producer;
         this.fields = new ArrayList<>();
 
+        // Star tree files always use empty suffix — hardcode to avoid generation-based suffixes
+        // that Lucene sets when segments have soft deletes (fieldInfosGen != -1).
+        String starTreeSuffix = "";
+
         String metaFileName = IndexFileNames.segmentFileName(
             readState.segmentInfo.name,
-            readState.segmentSuffix,
+            starTreeSuffix,
             Composite912DocValuesFormat.META_EXTENSION
         );
 
         String dataFileName = IndexFileNames.segmentFileName(
             readState.segmentInfo.name,
-            readState.segmentSuffix,
+            starTreeSuffix,
             Composite912DocValuesFormat.DATA_EXTENSION
         );
 
         boolean success = false;
-        try (ChecksumIndexInput metaIn = readState.directory.openChecksumInput(metaFileName)) {
+        // Resolve star tree file directory. For compound file segments upgraded retroactively,
+        // star tree files are in segmentInfo.dir, not inside .cfs. Falls back gracefully.
+        Directory starTreeDir = readState.directory;
+        boolean starTreeFilesExist = true;
+        try {
+            readState.directory.openInput(metaFileName, IOContext.DEFAULT).close();
+        } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e) {
+            // Star tree files not in readState.directory — try parent directory
+            starTreeDir = readState.segmentInfo.dir;
+            try {
+                starTreeDir.openInput(metaFileName, IOContext.DEFAULT).close();
+            } catch (java.io.FileNotFoundException | java.nio.file.NoSuchFileException e2) {
+                // Star tree files don't exist in either directory — this segment has no star tree data
+                // (e.g., called for a doc values update on a segment without star tree)
+                starTreeFilesExist = false;
+            }
+        }
+
+        if (starTreeFilesExist == false) {
+            // No star tree data — initialize empty
+            success = true;
+            return;
+        }
+
+        try (ChecksumIndexInput metaIn = starTreeDir.openChecksumInput(metaFileName)) {
 
             // initialize data input
-            dataIn = readState.directory.openInput(dataFileName, readState.context.withHints(FileTypeHint.DATA));
+            dataIn = starTreeDir.openInput(dataFileName, readState.context.withHints(FileTypeHint.DATA));
             CodecUtil.checkIndexHeader(
                 dataIn,
                 Composite912DocValuesFormat.DATA_CODEC_NAME,
                 Composite912DocValuesFormat.VERSION_START,
                 Composite912DocValuesFormat.VERSION_CURRENT,
                 readState.segmentInfo.getId(),
-                readState.segmentSuffix
+                starTreeSuffix
             );
 
             // initialize meta input
@@ -112,7 +142,7 @@ public class Composite912DocValuesReader extends DocValuesProducer implements Co
                     Composite912DocValuesFormat.VERSION_START,
                     Composite912DocValuesFormat.VERSION_CURRENT,
                     readState.segmentInfo.getId(),
-                    readState.segmentSuffix
+                    starTreeSuffix
                 );
                 Map<String, DocValuesType> dimensionFieldTypeMap = new HashMap<>();
                 while (true) {
@@ -192,11 +222,11 @@ public class Composite912DocValuesReader extends DocValuesProducer implements Co
                 // the dummy field info is used to fetch the doc id set iterators for respective fields based on field name
                 FieldInfos fieldInfos = new FieldInfos(getFieldInfoList(fields, dimensionFieldTypeMap));
                 this.readState = new SegmentReadState(
-                    readState.directory,
+                    starTreeDir,
                     readState.segmentInfo,
                     fieldInfos,
                     readState.context,
-                    readState.segmentSuffix
+                    starTreeSuffix
                 );
 
                 // initialize star-tree doc values producer
@@ -251,7 +281,9 @@ public class Composite912DocValuesReader extends DocValuesProducer implements Co
     @Override
     public void checkIntegrity() throws IOException {
         delegate.checkIntegrity();
-        CodecUtil.checksumEntireFile(dataIn);
+        if (dataIn != null) {
+            CodecUtil.checksumEntireFile(dataIn);
+        }
     }
 
     @Override

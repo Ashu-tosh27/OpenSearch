@@ -121,7 +121,13 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
          * if a shard was moved to a different node or for administrative
          * purposes.
          */
-        MAPPING_RECOVERY;
+        MAPPING_RECOVERY,
+        /**
+         * Star tree upgrade on an existing index. Bypasses composite index
+         * setting checks so that a star tree field can be added to an index
+         * that was created without {@code index.composite_index} enabled.
+         */
+        STAR_TREE_UPGRADE;
     }
 
     public static final String SINGLE_MAPPING_NAME = "_doc";
@@ -143,6 +149,21 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
     public static final Setting<Long> INDEX_MAPPING_TOTAL_FIELDS_LIMIT_SETTING = Setting.longSetting(
         "index.mapping.total_fields.limit",
         1000L,
+        0,
+        Property.Dynamic,
+        Property.IndexScope
+    );
+    /**
+     * Per-shard limit on the total number of Lucene fields (across all segments) that may be created by
+     * {@code dynamic_properties} matching. Unlike OpenSearch mapping fields, Lucene fields are cheaper, but
+     * they are still not free—especially when doc values are enabled. This setting caps growth at the Lucene
+     * layer, independently of {@code index.mapping.total_fields.limit} which governs mapping-state fields.
+     * Defaults to 10 000 (10× the OpenSearch mapping default), reflecting the lower per-field cost in Lucene.
+     * Can be raised dynamically if heap headroom is available.
+     */
+    public static final Setting<Long> INDEX_MAPPING_DYNAMIC_PROPERTIES_LUCENE_FIELD_LIMIT_SETTING = Setting.longSetting(
+        "index.mapping.dynamic_properties.lucene_field.limit",
+        10000L,
         0,
         Property.Dynamic,
         Property.IndexScope
@@ -225,6 +246,12 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
 
     final MapperRegistry mapperRegistry;
 
+    /**
+     * Tracks Lucene field names for the shard, updated on each NRT refresh.
+     * Used by {@link DocumentParser} to enforce the dynamic-properties field-count limit.
+     */
+    private final LuceneFieldTracker luceneFieldTracker = new LuceneFieldTracker();
+
     private final BooleanSupplier idFieldDataEnabled;
 
     private volatile Set<CompositeMappedFieldType> compositeMappedFieldTypes;
@@ -290,6 +317,14 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
 
     public DocumentMapperParser documentMapperParser() {
         return this.documentParser;
+    }
+
+    /**
+     * Returns the {@link LuceneFieldTracker} for this shard's mapper service.
+     * The tracker is updated on each NRT refresh by {@code InternalEngine}.
+     */
+    public LuceneFieldTracker getLuceneFieldTracker() {
+        return luceneFieldTracker;
     }
 
     /**
@@ -817,16 +852,36 @@ public class MapperService extends AbstractIndexComponent implements Closeable {
     }
 
     public synchronized List<String> reloadSearchAnalyzers(AnalysisRegistry registry) throws IOException {
-        logger.info("reloading search analyzers");
-        // refresh indexAnalyzers and search analyzers
+        return reloadSearchAnalyzers(registry, false);
+    }
+
+    /**
+     * Reloads search analyzers, optionally reloading cached resources (e.g. hunspell dictionaries) first.
+     *
+     * @param registry The analysis registry
+     * @param reloadCachedResources If true, reloads cached resources (e.g. hunspell dictionaries) before rebuilding analyzers
+     * @return List of reloaded analyzer names
+     */
+    public synchronized List<String> reloadSearchAnalyzers(AnalysisRegistry registry, boolean reloadCachedResources) throws IOException {
+        logger.info("reloading search analyzers (reloadCachedResources={})", reloadCachedResources);
+
+        if (reloadCachedResources) {
+            // Reload cached resources BEFORE building new factories so they pick up fresh data
+            for (NamedAnalyzer namedAnalyzer : indexAnalyzers.getAnalyzers().values()) {
+                if (namedAnalyzer.analyzer() instanceof ReloadableCustomAnalyzer analyzer) {
+                    Arrays.stream(analyzer.getComponents().getTokenFilters()).forEach(TokenFilterFactory::reloadCachedResources);
+                }
+            }
+        }
+
+        // Build new factories — they will load fresh dictionaries from disk
         final Map<String, TokenizerFactory> tokenizerFactories = registry.buildTokenizerFactories(indexSettings);
         final Map<String, CharFilterFactory> charFilterFactories = registry.buildCharFilterFactories(indexSettings);
         final Map<String, TokenFilterFactory> tokenFilterFactories = registry.buildTokenFilterFactories(indexSettings);
         final Map<String, Settings> settings = indexSettings.getSettings().getGroups("index.analysis.analyzer");
         final List<String> reloadedAnalyzers = new ArrayList<>();
         for (NamedAnalyzer namedAnalyzer : indexAnalyzers.getAnalyzers().values()) {
-            if (namedAnalyzer.analyzer() instanceof ReloadableCustomAnalyzer) {
-                ReloadableCustomAnalyzer analyzer = (ReloadableCustomAnalyzer) namedAnalyzer.analyzer();
+            if (namedAnalyzer.analyzer() instanceof ReloadableCustomAnalyzer analyzer) {
                 String analyzerName = namedAnalyzer.name();
                 Settings analyzerSettings = settings.get(analyzerName);
                 analyzer.reload(analyzerName, analyzerSettings, tokenizerFactories, charFilterFactories, tokenFilterFactories);
